@@ -3,7 +3,7 @@ import { PDFDocument, PDFName, PDFNumber } from 'pdf-lib';
 export interface Crop { x: number; y: number; w: number; h: number }
 
 /** Draw the chosen part of the image at its native pixels (no fake resolution). */
-export function renderCrop(img: HTMLImageElement | ImageBitmap, crop: Crop, mirror: boolean): HTMLCanvasElement {
+export function renderCrop(img: CanvasImageSource, crop: Crop, mirror: boolean): HTMLCanvasElement {
   const c = document.createElement('canvas');
   c.width = Math.max(1, Math.round(crop.w));
   c.height = Math.max(1, Math.round(crop.h));

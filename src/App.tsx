@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { PRESETS, UNIT_TO_IN, Unit, UseKind, fmtLength, rateDpi } from './presets';
 import { Crop, download, makePdf, makeTiff, renderCrop } from './exporters';
+import { Src, enlargeTiled, nextScale } from './enlarge';
 
 type Panels = 'off' | 'v' | 'h';
 const PDF_MAX_IN = 200; // PDF pages cannot exceed 200 inches at 100%
@@ -21,9 +22,9 @@ function loadImage(src: string): Promise<HTMLImageElement> {
 }
 
 export default function App() {
-  const [img, setImg] = useState<HTMLImageElement | null>(null);
+  const [img, setImg] = useState<Src | null>(null);
   const [fileName, setFileName] = useState('');
-  const [upscaled, setUpscaled] = useState(false);
+  const [upscaled, setUpscaled] = useState(0); // total AI enlargement factor applied
   const [presetId, setPresetId] = useState('trailer53');
   const preset0 = PRESETS.find((p) => p.id === 'trailer53')!;
   const [kind, setKind] = useState<UseKind>(preset0.kind);
@@ -51,7 +52,7 @@ export default function App() {
   const crop: Crop | null = useMemo(() => {
     if (!img || outW <= 0 || outH <= 0) return null;
     const A = outW / outH;
-    const iw = img.naturalWidth, ih = img.naturalHeight;
+    const iw = img.w, ih = img.h;
     let cw: number, ch: number;
     if (iw / ih > A) { ch = ih; cw = ih * A; } else { cw = iw; ch = iw / A; }
     cw /= zoom; ch /= zoom;
@@ -69,7 +70,7 @@ export default function App() {
     if (!f.type.startsWith('image/')) { setError('Please drop an image file (PNG, JPG or WebP).'); return; }
     try {
       const i = await loadImage(URL.createObjectURL(f));
-      setImg(i); setFileName(f.name.replace(/\.[^.]+$/, '')); setUpscaled(false);
+      setImg({ el: i, w: i.naturalWidth, h: i.naturalHeight }); setFileName(f.name.replace(/\.[^.]+$/, '')); setUpscaled(0);
       setZoom(1); setPos({ x: 0.5, y: 0.5 });
     } catch (e) { setError((e as Error).message); }
   }, []);
@@ -111,7 +112,7 @@ export default function App() {
     ctx.save();
     if (mirror) { ctx.translate(view.w, 0); ctx.scale(-1, 1); }
     ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(img, crop.x, crop.y, crop.w, crop.h, 0, 0, view.w, view.h);
+    ctx.drawImage(img.el, crop.x, crop.y, crop.w, crop.h, 0, 0, view.w, view.h);
     ctx.restore();
     const s = view.ppi, b = bleedIn * s;
     // bleed shading
@@ -145,7 +146,7 @@ export default function App() {
   const onPointerMove = (e: React.PointerEvent) => {
     if (!drag.current || !img || !crop) return;
     const k = crop.w / view.w; // image px per screen px
-    const freeX = img.naturalWidth - crop.w, freeY = img.naturalHeight - crop.h;
+    const freeX = img.w - crop.w, freeY = img.h - crop.h;
     const dx = (e.clientX - drag.current.x) * k * (mirror ? -1 : 1);
     const dy = (e.clientY - drag.current.y) * k;
     setPos({
@@ -164,25 +165,14 @@ export default function App() {
     if (p.kind === 'window') setUnit('in');
   };
 
+  const scaleNext = img ? nextScale(img.w, img.h) : 0;
   const enlarge = async () => {
-    if (!img) return;
-    setError(''); setBusy('Enlarging with AI. This usually takes 20 to 60 seconds…');
+    if (!img || !scaleNext) return;
+    setError(''); setBusy('Enlarging with AI…');
     try {
-      // keep the upload small enough for the server
-      const maxPx = 2_000_000;
-      const s = Math.min(1, Math.sqrt(maxPx / (img.naturalWidth * img.naturalHeight)));
-      const c = document.createElement('canvas');
-      c.width = Math.round(img.naturalWidth * s); c.height = Math.round(img.naturalHeight * s);
-      c.getContext('2d')!.drawImage(img, 0, 0, c.width, c.height);
-      const r = await fetch('/api/upscale', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: c.toDataURL('image/jpeg', 0.93), scale: 4 }),
-      });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok || !j.url) throw new Error(j.error || 'AI enlargement is not available right now.');
-      const blob = await (await fetch(j.url)).blob();
-      const big = await loadImage(URL.createObjectURL(blob));
-      setImg(big); setUpscaled(true);
+      const out = await enlargeTiled(img, scaleNext, (done, total) =>
+        setBusy(total > 1 ? `Enlarging with AI, part ${done} of ${total}. Bigger images take a few minutes…` : 'Enlarging with AI. This usually takes 20 to 60 seconds…'));
+      setImg(out); setUpscaled((u) => (u || 1) * scaleNext);
     } catch (e) { setError((e as Error).message); }
     finally { setBusy(''); }
   };
@@ -195,7 +185,7 @@ export default function App() {
     await new Promise((r) => setTimeout(r, 30));
     try {
       const fullSize = outW <= PDF_MAX_IN && outH <= PDF_MAX_IN;
-      const canvas = renderCrop(img, crop, mirror);
+      const canvas = renderCrop(img.el, crop, mirror);
       const bytes = await makePdf(canvas, { trimWIn: wIn, trimHIn: hIn, bleedIn, scale: fullSize ? 1 : 0.1, title: baseName() });
       download(bytes, `${baseName()}${fullSize ? '' : '_1-10scale'}.pdf`, 'application/pdf');
     } catch (e) { setError('Export failed: ' + (e as Error).message); }
@@ -207,7 +197,7 @@ export default function App() {
     setError(''); setBusy('Building TIFF…');
     await new Promise((r) => setTimeout(r, 30));
     try {
-      const canvas = renderCrop(img, crop, mirror);
+      const canvas = renderCrop(img.el, crop, mirror);
       download(makeTiff(canvas, dpi), `${baseName()}.tif`, 'image/tiff');
     } catch (e) { setError('Export failed: ' + (e as Error).message + '. Try the PDF instead.'); }
     finally { setBusy(''); }
@@ -314,15 +304,14 @@ export default function App() {
                 <strong>{Math.round(dpi)} dots per inch at full size</strong>
                 <p>{rating.detail}</p>
                 <p className="muted">
-                  Your image is {img.naturalWidth.toLocaleString()} × {img.naturalHeight.toLocaleString()} pixels{upscaled ? ' (AI enlarged)' : ''}.
-                  For "Sharp" at {fmtLength(outW)} × {fmtLength(outH)} with bleed you'd want about {needPx.w.toLocaleString()} × {needPx.h.toLocaleString()} pixels.
+                  Your image is {img.w.toLocaleString()} × {img.h.toLocaleString()} pixels{upscaled ? ` (AI enlarged ${upscaled}×)` : ''}{'. '}{rating.level !== 'good' && !scaleNext ? 'This is the largest size the browser can handle. ' : ''}For "Sharp" at {fmtLength(outW)} × {fmtLength(outH)} with bleed you'd want about {needPx.w.toLocaleString()} × {needPx.h.toLocaleString()} pixels.
                 </p>
               </div>
             </div>
 
             <div className="actions">
-              {!upscaled && rating.level !== 'good' && (
-                <button className="primary" disabled={!!busy} onClick={enlarge}>✨ Enlarge with AI (4×)</button>
+              {rating.level !== 'good' && scaleNext > 0 && (
+                <button className="primary" disabled={!!busy} onClick={enlarge}>✨ {upscaled ? `Enlarge again (${scaleNext}×)` : `Enlarge with AI (${scaleNext}×)`}</button>
               )}
               <button className={upscaled || rating.level === 'good' ? 'primary' : ''} disabled={!!busy} onClick={exportPdf}>Download PDF</button>
               <button disabled={!!busy} onClick={exportTiff}>Download TIFF</button>
